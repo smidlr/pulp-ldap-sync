@@ -1,0 +1,514 @@
+#!/usr/bin/env python
+"""
+The pulp-ldap-sync script is used for syncing LDAP users with pulp
+
+"""
+
+import random
+import string
+import ConfigParser
+import sys
+
+import ldap
+import zb_api
+from docopt import docopt
+
+class LDAPConn(object):
+    """
+    LDAP connector class
+
+    Defines methods for retrieving users and groups from LDAP server.
+
+    """
+    def __init__(self, uri, base, user, passwd):
+        self.uri   = uri
+        self.base  = base
+        self.ldap_user  = user
+        self.ldap_pass  = passwd
+
+    def connect(self):
+        """
+        Establish a connection to the LDAP server.
+
+        Raises:
+            SystemExit
+
+        """
+        self.conn  = ldap.initialize(self.uri)
+
+        try:
+            self.conn.simple_bind(self.ldap_user, self.ldap_pass)
+        except ldap.SERVER_DOWN as e:
+            raise SystemExit, 'Cannot connect to LDAP server: %s' % e
+
+    def disconnect(self):
+        """
+        Disconnect from the LDAP server.
+
+        """
+        self.conn.unbind()
+
+    def get_group_members(self, group):
+        """
+        Retrieves the members of an LDAP group
+
+        Args:
+            group (str): The LDAP group name
+
+        Returns:
+            A list of all users in the LDAP group
+
+        """
+        attrlist = [group_member_attribute]
+        filter   = group_filter % group
+
+        result = self.conn.search_s(base=self.base,
+                                    scope=ldap.SCOPE_SUBTREE,
+                                    filterstr=filter,
+                                    attrlist=attrlist)
+
+        if not result:
+            print '>>> Unable to find group %s, skipping group' % group
+            return None
+
+        # if this is activedirectory, we have to replace each CN with the actual username
+        if active_directory:
+
+            final_listing = []
+
+            for members in result:
+                result_dn = members[0]
+                result_attrs = members[1]
+
+            if "member" in result_attrs:
+                for member in result_attrs["member"]:
+
+                    attrlist = ['sAMAccountName']
+                    filter   = '(&(objectClass=person)(distinguishedName=%s))' % member
+
+                    # get the actual LDAP object for each group member
+                    uid = self.conn.search_s(base=self.base,
+                                    scope=ldap.SCOPE_SUBTREE,
+                                    filterstr=filter,
+                                    attrlist=attrlist)
+
+                    dn, users = uid.pop()
+                    username = users.get('sAMAccountName')
+                    final_listing.append(str(username)[2 : -2])
+
+            return final_listing
+
+        else:
+
+            dn, users = result.pop()
+
+            return users[group_member_attribute]
+
+    def get_user_email(self, username):
+        """
+        Retrieves the 'mail' attribute of an LDAP user
+
+        Args:
+            username (str): The LDAP username to lookup
+
+        Returns:
+            The user's mail attribute
+
+        """
+        attrlist = ['mail']
+        filter   = mail_filter % username
+
+        result = self.conn.search_s(base=self.base,
+                                    scope=ldap.SCOPE_SUBTREE,
+                                    filterstr=filter,
+                                    attrlist=attrlist)
+
+        if not result:
+            return None
+
+        dn, data = result.pop()
+
+        mail = data.get('mail')
+
+        if not mail:
+            return None
+
+        return mail.pop()
+
+    def get_user_sn(self, username):
+        """
+        Retrieves the 'sn' attribute of an LDAP user
+
+        Args:
+            username (str): The LDAP username to lookup
+
+        Returns:
+            The user's surname attribute
+
+        """
+        attrlist = ['sn']
+        filter   = sn_filter % username
+
+        result = self.conn.search_s(base=self.base,
+                                    scope=ldap.SCOPE_SUBTREE,
+                                    filterstr=filter,
+                                    attrlist=attrlist)
+
+        if not result:
+            return None
+
+        dn, data = result.pop()
+
+        sn = data.get('sn')
+
+        if not sn:
+            return None
+
+        return sn.pop()
+
+    def get_user_givenname(self, username):
+        """
+        Retrieves the 'givenName' attribute of an LDAP user
+
+        Args:
+            username (str): The LDAP username to lookup
+
+        Returns:
+            The user's given name attribute
+
+        """
+        attrlist = ['givenName']
+        filter   = givenname_filter % username
+
+        result = self.conn.search_s(base=self.base,
+                                    scope=ldap.SCOPE_SUBTREE,
+                                    filterstr=filter,
+                                    attrlist=attrlist)
+
+        if not result:
+            return None
+
+        dn, data = result.pop()
+
+        name = data.get('givenName')
+
+        if not name:
+            return None
+
+        return name.pop()
+
+class ZBConn(object):
+    """
+    ZB connector class
+
+    Defines methods for managing ZB users and groups
+
+    """
+    def __init__(self, server, username, password):
+        self.server   = server
+        self.username = username
+        self.password = password
+
+    def connect(self):
+        """
+        Establishes a connection to the ZB server
+
+        Raises:
+            SystemExit
+
+        """
+        self.conn = zb_api.ZBAPI(server=self.server)
+
+        try:
+            self.conn.login(user=self.username, password=self.password)
+        except zb_api.ZBAPIException as e:
+            raise SystemExit, 'Cannot login to ZB server: %s' % e
+
+    def get_users(self):
+        """
+        Retrieves the existing ZB users
+
+        Returns:
+            A list of the existing ZB users
+
+        """
+        req = self.conn.json_obj(method='user.get', params={'output': 'extend'})
+        result = self.conn.do_request(req)
+
+        users = [user['alias'] for user in result['result']]
+
+        return users
+
+    def get_user_id(self, user):
+        """
+        Retrieves the userid of a specified user
+
+        Args:
+            user (str): The ZB username to lookup
+
+        Returns:
+            The userid of the specified user
+
+        """
+        req = self.conn.json_obj(method='user.get', params={'output': 'extend'})
+        result = self.conn.do_request(req)
+
+        userid = [u['userid'] for u in result['result'] if u['alias'] == user].pop()
+
+        return userid
+
+    def get_groups(self):
+        """
+        Retrieves the existing ZB groups
+
+        Returns:
+            A dict of the existing ZB groups and their group ids
+
+        """
+        req = self.conn.json_obj(method='usergroup.get',
+                                 params={'status': 0, 'output': 'extend' })
+
+        result = self.conn.do_request(req)
+
+        groups = [{'name': group['name'], 'usrgrpid': group['usrgrpid']} for group in result['result']]
+
+        return groups
+
+    def get_group_members(self, groupid):
+        """
+        Retrieves group members for a ZB group
+
+        Args:
+            groupid (int): The group id
+
+        Returns:
+            A list of the ZB users for the specified group id
+
+        """
+        req = self.conn.json_obj(method='user.get', params={'output': 'extend', 'usrgrpids': groupid})
+        result = self.conn.do_request(req)
+
+        users = [user['alias'] for user in result['result']]
+
+        return users
+
+
+    def create_group(self, group):
+        """
+        Creates a new ZB group
+
+        Args:
+            group (str): The ZB group name to create
+
+        Returns:
+            The groupid of the newly created group
+
+        """
+        req = self.conn.json_obj(method='usergroup.create',
+                                 params={'name': group, 'permission': 3})
+
+        result = self.conn.do_request(req)
+        groupid = result['result']['usrgrpids'].pop()
+
+        return groupid
+
+    def create_user(self, user, groupid):
+        """
+        Creates a new ZB user
+
+        Args:
+            user    (dict): A dict containing the user details
+            groupid  (int): The groupid for the new user
+
+        """
+        random_passwd = ''.join(random.sample(string.ascii_letters + string.digits, 32))
+
+        user_defaults = { 'autologin': 0, 'type': 1, 'usrgrps': [ { 'usrgrpid': str(groupid) } ], 'passwd': random_passwd}
+        user.update(user_defaults)
+
+        req = self.conn.json_obj(method='user.create',
+                                 params=user)
+
+        result = self.conn.do_request(req)
+
+        return result['result']
+
+    def update_user(self, user, groupid):
+        """
+        Adds an existing ZB user to a group
+
+        Args:
+            user    (dict): A dict containing the user details
+            groupid  (int): The groupid to add the user to
+
+        """
+        userid = self.get_user_id(user)
+
+        req = self.conn.json_obj(method='usergroup.massadd',
+                                params={'usrgrpids': [str(groupid)], 'userids': [str(userid)] })
+
+        result = self.conn.do_request(req)
+
+        return result['result']
+
+    def update_media(self, user, mail):
+        """
+        Adds media (email) to an existing ZB user
+
+        Args:
+            user    (dict): A dict containing the user details
+
+        """
+
+        userid = self.get_user_id(user)
+
+        req = self.conn.json_obj(method='user.addmedia',
+                                params={'users': [ { "userid": str(userid) } ],
+                                        'medias': { 'mediatypeid': '1',
+                                                    'sendto': mail,
+                                                    'active': '0',
+                                                    'severity': '63',
+                                                    'period': '1-7,00:00-24:00' }
+                                        })
+
+        result = self.conn.do_request(req)
+
+        return result['result']
+
+    def create_missing_groups(self, ldap_groups):
+        """
+        Creates any missing LDAP groups in ZB
+
+        Args:
+            ldap_groups (list): A list of LDAP groups to create
+
+        """
+        missing_groups = set(ldap_groups) - set([g['name'] for g in self.get_groups()])
+
+        for eachGroup in missing_groups:
+            print '>>> Creating ZB group %s' % eachGroup
+            grpid = self.create_group(eachGroup)
+            print '>>> Group %s created with groupid %s' % (eachGroup, grpid)
+
+    def sync_users(self, ldap_uri, ldap_base, ldap_groups, ldap_user, ldap_pass):
+        """
+        Syncs ZB with LDAP users
+
+        """
+        ldap_conn = LDAPConn(ldap_uri, ldap_base, ldap_user, ldap_pass)
+        ldap_conn.connect()
+
+        zb_all_users = self.get_users()
+
+        for eachGroup in ldap_groups:
+            ldap_users = ldap_conn.get_group_members(eachGroup)
+
+            if not ldap_users:
+                continue
+
+            zb_grpid = [g['usrgrpid'] for g in self.get_groups() if g['name'] == eachGroup].pop()
+
+            zb_group_users = self.get_group_members(zb_grpid)
+
+            missing_users = set(ldap_users) - set(zb_group_users)
+
+            # Add missing users
+            for eachUser in missing_users:
+
+                # Create new user if it does not exists already
+                if eachUser not in zb_all_users:
+                    print '>>> Creating user %s, member of ZB group %s' % (eachUser, eachGroup)
+                    user = { 'alias': eachUser }
+                    user['name'] = ldap_conn.get_user_givenname(eachUser)
+                    user['surname'] = ldap_conn.get_user_sn(eachUser)
+                    self.create_user(user, zb_grpid)
+                    zb_all_users.append(eachUser)
+                    print '>>> Updating user media for %s, adding email' % eachUser
+                    mailaddress = ldap_conn.get_user_email(eachUser)
+                    if mailaddress:
+                        self.update_media(eachUser, mailaddress)
+                else:
+                    # Update existing user to be member of the group
+                    print '>>> Updating user %s, adding to group %s' % (eachUser, eachGroup)
+                    self.update_user(eachUser, zb_grpid)
+
+            # Just mention any extra users in the groups, do not remove them
+            extra_users = set(zb_group_users) - set(ldap_users)
+            if extra_users:
+                print '>>> Users in group %s which are not found in LDAP group:' % eachGroup
+                for eachUser in extra_users:
+                    print ' * %s' % eachUser
+
+        ldap_conn.disconnect()
+
+class ZBLDAPConf(object):
+    """
+    ZB-LDAP configuration class
+
+    Provides methods for parsing and retrieving config entries
+
+    """
+    def __init__(self, config):
+        self.config = config
+
+    def load_config(self):
+        """
+        Loads the configuration file
+
+        Raises:
+            ConfigParser.NoOptionError
+
+        """
+        parser = ConfigParser.ConfigParser()
+        parser.read(self.config)
+
+        try:
+            self.ldap_uri     = parser.get('ldap', 'uri')
+            self.ldap_base    = parser.get('ldap', 'base')
+            self.ldap_groups  = parser.get('ldap', 'groups').split(',')
+            self.ldap_type    = parser.get('ldap', 'type')
+            self.ldap_user    = parser.get('ldap', 'binduser')
+            self.ldap_pass    = parser.get('ldap', 'bindpass')
+            self.zbx_server   = parser.get('zb', 'server')
+            self.zbx_username = parser.get('zb', 'username')
+            self.zbx_password = parser.get('zb', 'password')
+        except ConfigParser.NoOptionError as e:
+            raise SystemExit, 'Configuration issues detected in %s' % self.config
+
+def main():
+    usage="""
+Usage: pulp-ldap-sync -f <config>
+       pulp-ldap-sync -v
+       pulp-ldap-sync -h
+
+Options:
+  -h, --help                    Display this usage info
+  -v, --version                 Display version and exit
+  -f <config>, --file <config>  Configuration file to use
+
+"""
+    args = docopt(usage, version="0.1.0")
+
+    config = ZBLDAPConf(args['--file'])
+    config.load_config()
+
+    # set up AD differences, if necessary
+    global group_filter
+    global group_member_attribute
+    global uid_attribute
+    global sn_filter
+    global givenname_filter
+    global mail_filter
+    group_filter = "(&(objectClass=posixGroup)(cn=%s))"
+    group_member_attribute = "memberUid"
+    sn_filter = "(&(objectClass=posixAccount)(uid=%s))"
+    givenname_filter = "(&(objectClass=posixAccount)(uid=%s))"
+    mail_filter = "(&(objectClass=posixAccount)(uid=%s))"
+    zb_conn = ZBConn(config.zbx_server, config.zbx_username, config.zbx_password)
+    zb_conn.connect()
+
+    zb_conn.create_missing_groups(config.ldap_groups)
+    zb_conn.sync_users(config.ldap_uri, config.ldap_base, config.ldap_groups, config.ldap_user, config.ldap_pass)
+
+if __name__ == '__main__':
+    main()
